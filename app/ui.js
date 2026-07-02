@@ -40,7 +40,17 @@
 
   function afterMediaChange() {
     preview.render(episode);
-    if (canCompose(episode)) preview.play();
+    if (canCompose(episode)) {
+      if (PDC.captions && PDC.captions.hasCaptions(episode)) {
+        const cues = PDC.captions.listCues(episode);
+        const first = cues[0];
+        const t = Math.max(0, Math.min(first.end - 0.05, first.start + 0.05));
+        preview.pause();
+        preview.seekTo(t);
+      } else {
+        preview.play();
+      }
+    }
     refresh();
   }
 
@@ -218,10 +228,86 @@
   }
   scrubEl.addEventListener("input", function () {
     const t = Number(scrubEl.value);
+    preview.pause();
     preview.seekTo(t);
     scrubTimeEl.textContent = M.formatTime(t);
   });
   setInterval(syncScrub, 200);
+
+  // WebVTT caption import: parse user-supplied .vtt files onto the episode so
+  // cues survive preset/template switches and render on the preview canvas.
+  const C = PDC.captions;
+  function renderCaptionList() {
+    const list = $("caption-list");
+    list.innerHTML = "";
+    C.listCues(episode).forEach(function (cue) {
+      const li = document.createElement("li");
+      const range = document.createElement("span");
+      range.className = "caption-range";
+      range.textContent = M.formatTime(cue.start) + "–" + M.formatTime(cue.end);
+      const text = document.createElement("span");
+      text.className = "caption-text";
+      text.textContent = cue.text;
+      li.append(range, text);
+      list.appendChild(li);
+    });
+  }
+  function syncCaptionUi() {
+    const has = C.hasCaptions(episode);
+    $("caption-clear").hidden = !has;
+    $("caption-status").textContent = has
+      ? "Imported " + episode.captions.fileName + " — " + C.listCues(episode).length + " cue(s)."
+      : "No caption file imported.";
+    renderCaptionList();
+  }
+  function afterCaptionImport(parsed, fileName) {
+    C.setCaptions(episode, fileName, parsed.cues);
+    syncCaptionUi();
+    preview.render(episode);
+    if (canCompose(episode)) {
+      const first = parsed.cues[0];
+      const t = Math.max(0, Math.min(first.end - 0.05, first.start + 0.05));
+      preview.pause();
+      preview.seekTo(t);
+      scrubEl.value = String(t);
+      scrubTimeEl.textContent = M.formatTime(t);
+    } else {
+      preview.drawFrame();
+    }
+    refresh();
+  }
+  function ingestCaptionFile(file) {
+    if (!file) return;
+    $("caption-status").textContent = "Reading " + file.name + "...";
+    const reader = new FileReader();
+    reader.onload = function () {
+      const parsed = C.parseWebVTT(reader.result);
+      if (!parsed.ok) {
+        $("caption-status").textContent = parsed.error;
+        return;
+      }
+      afterCaptionImport(parsed, file.name);
+      $("caption-file").value = "";
+    };
+    reader.onerror = function () {
+      $("caption-status").textContent = "Could not read the caption file.";
+    };
+    reader.readAsText(file);
+  }
+  function onCaptionFileInput() {
+    const file = $("caption-file").files && $("caption-file").files[0];
+    if (!file) return;
+    ingestCaptionFile(file);
+  }
+  $("caption-file").addEventListener("change", onCaptionFileInput);
+  $("caption-file").addEventListener("input", onCaptionFileInput);
+  $("caption-clear").addEventListener("click", function () {
+    C.clearCaptions(episode);
+    $("caption-file").value = "";
+    syncCaptionUi();
+    preview.drawFrame();
+    refresh();
+  });
 
   const audioButtons = Array.from(document.querySelectorAll("button[data-audio-setting]"));
   const AUDIO_KEYS = ["leveling", "clarity", "noiseReduction"];
@@ -287,10 +373,23 @@
 
   // Apply any layout (preset id or saved template id) and sync selection state.
   function applyLayout(id) {
+    const holdTime = preview.getTime();
     setPreset(episode, id);
     markSelected(id);
     preview.render(episode);
-    if (canCompose(episode)) preview.play();
+    if (canCompose(episode)) {
+      if (C.hasCaptions(episode)) {
+        const cues = C.listCues(episode);
+        const sample = Math.max(0, Math.min(cues[0].end - 0.05, cues[0].start + 0.05));
+        const t = holdTime > 0 ? holdTime : sample;
+        preview.pause();
+        preview.seekTo(t);
+        scrubEl.value = String(t);
+        scrubTimeEl.textContent = M.formatTime(t);
+      } else {
+        preview.play();
+      }
+    }
     refresh();
   }
 
@@ -372,9 +471,12 @@
     PDC.episode.resetEpisode(episode, { title: "Episode 1" });
     PDC.momentImages.releaseAll();
     clearPreparedMomentImage();
+    PDC.captions.clearCaptions(episode);
 
     document.querySelectorAll("input[data-file-bucket]").forEach(function (input) { input.value = ""; });
     document.querySelectorAll("input[data-link-bucket]").forEach(function (input) { input.value = ""; });
+    $("caption-file").value = "";
+    syncCaptionUi();
     $("moment-text").value = "";
     $("moment-start").value = "";
     $("moment-end").value = "";
@@ -413,6 +515,7 @@
     const btn = $("export");
     btn.disabled = true;
     btn.textContent = "⏳ Exporting…";
+    preview.seekTo(0);
     preview.play(); // ensure the canvas is composing live frames while we capture
     $("export-progress").hidden = false;
     $("export-result").hidden = true;
@@ -433,6 +536,7 @@
         "Audio: " + getAudioQuality(episode).leveling + " leveling, " +
         getAudioQuality(episode).clarity + " clarity, " +
         getAudioQuality(episode).noiseReduction + " noise reduction. " +
+        (C.hasCaptions(episode) ? C.listCues(episode).length + " caption cue(s). " : "") +
         '<a id="export-download" href="' + out.url + '" download="' + fname + '">Download again</a>';
       // A real playable preview of the exported file (also lets review confirm playback).
       const v = document.createElement("video");
@@ -473,6 +577,7 @@
   SPEAKER_BUCKETS.forEach(updateBucketRow);
   syncAudioUi();
   renderMomentList();
+  syncCaptionUi();
   renderTemplates();
   refresh();
 })();
